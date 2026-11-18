@@ -56,6 +56,8 @@ td,th {padding:9px!important;}
 
 outlier_pca <- function(X, K, lambda, max_iter = 1000, tol = 1e-6) {
   
+  # outlier_pca: Algorithm 3을 단일 함수로 구현 (2차원 예제, 다변량 예제의 최종 실행에 사용)
+  
   n <- nrow(X)
   p <- ncol(X)  # X = n * p
   
@@ -531,23 +533,6 @@ pca_rank2 <- function(X, K = 2) {
   )
 }
 
-reconstruct_rank2 <- function(pca_result) {  # PCA 결과 복원 함수
-  
-  pca_result$U %*%
-  reconstruct_rank2 <- function(pca_result) {
-      
-      K <- length(pca_result$D)
-      
-      pca_result$U %*%
-        diag(pca_result$D, nrow = K, ncol = K) %*%
-        t(pca_result$V)
-  } %*%
-  t(pca_result$V)
-}
-
-
-
-
 ```
 
 
@@ -619,6 +604,8 @@ calculate_oer <- function(estimated_outliers, true_outliers, N) {
 
 opca_fixed_lambda <- function(X, lambda, K = 2,
                               max_iter = 1000, tol = 1e-6) {
+  
+  # opca_fixed_lambda: 모의실험과 λ 선택(select_opca_lambda)에 사용하는 구현
   
   N <- nrow(X)
   p <- ncol(X)
@@ -1718,8 +1705,8 @@ set.seed(123)
 K <- 2
 B <- 30
 
-track_m <- read.csv("/Users/hee/Downloads/track_m.csv", check.names = FALSE)
-track_w <- read.csv("/Users/hee/Downloads/track_w.csv", check.names = FALSE)
+track_m <- read.csv("data/track_m.csv", check.names = FALSE)
+track_w <- read.csv("data/track_w.csv", check.names = FALSE)
 
 datasets <- list(track_m = track_m, track_w = track_w)
 
