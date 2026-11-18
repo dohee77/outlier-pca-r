@@ -1,0 +1,2070 @@
+---
+title: "Outlier PCA R 구현"
+subtitle: "Algorithm 3 · Figure 4 · Table 2"
+author: "윤도희"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+    code_folding: hide
+    code_download: true
+    theme: flatly
+    highlight: tango
+    df_print: kable
+    self_contained: true
+    mathjax: null
+---
+
+<style>
+body {font-family:-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:15px; line-height:1.8; color:#24364b;}
+.main-container {max-width:1180px;}
+h1.title {font-size:36px; font-weight:750; color:#183959; border:0;}
+h1 {font-size:27px; color:#183959; border-top:1px solid #dce5ee; padding-top:26px; margin-top:36px;}
+h2 {font-size:21px; color:#285674; margin-top:28px;}
+.subtitle {color:#6b7e90;}
+.intro {background:#eff6fa; border-left:4px solid #358398; padding:16px 22px; margin:22px 0;}
+.formula {background:#f5f7fa; padding:16px 20px; font-family:Georgia,serif; font-size:18px; overflow-x:auto; margin:16px 0;}
+.source {font-size:13px;color:#6c7f90;}
+pre {font-size:12px; max-height:620px; overflow:auto; border-radius:6px;}
+.table {font-size:14px;}
+th {background:#edf3f8;}
+td,th {padding:9px!important;}
+.tocify {font-size:13px;}
+@media print {#TOC,.code-folding-btn {display:none!important;} pre{max-height:none;} h1,h2{break-after:avoid;}}
+</style>
+
+# 1. Outlier PCA 알고리즘
+
+<span class="source">원본: opca algorithm 3.R · 논문: 4.1절, 식 (24)–(26), Algorithm 3</span>
+
+관측치별 오차 E를 추정하여 일부 행만 0이 아닌 값을 갖도록 한다. X − E의 rank-K SVD와 E의 갱신을 반복한 뒤, 오차가 0인 관측치만으로 최종 PCA를 수행한다.
+
+<div class="formula">min ½‖X − E − UDVᵀ‖<sub>F</sub>² + λ Σ<sub>i</sub> ‖E<sub>i</sub>‖<sub>2</sub>,　UᵀU = VᵀV = I<sub>K</sub></div>
+
+오차 갱신은 rᵢ = Xᵢ − UᵢDVᵀ에 대해 Eᵢ = rᵢ max(0, 1 − λ/‖rᵢ‖₂)이다. 함수는 최종 방향 V, 오차 E, 이상치 인덱스 및 반복 횟수를 반환한다.
+
+```{r original-01, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+
+
+# ============================================================
+# Outlier PCA (OPCA) 
+# Algorithm 3
+# ============================================================
+
+
+outlier_pca <- function(X, K, lambda, max_iter = 1000, tol = 1e-6) {
+  
+  n <- nrow(X)
+  p <- ncol(X)  # X = n * p
+  
+  
+  # 1. Initialize E
+  
+  center <- colMeans(X)  # 각 열의 평균
+  X_centered <- sweep(X, 2, center, FUN = "-")  # 각 열에서 해당 열 평균 빼기
+  distances <- sqrt(rowSums(X_centered^2))  # 전체 평균으로부터 유클리드 거리
+
+  n_zero <- floor(0.9 * n)  # E = 0 : 관측치의 90 %
+  
+  order_idx <- order(distances)  # 거리 순서 정렬
+  
+  zero_idx <- order_idx[1:n_zero]  # 정상
+  outlier_idx <- order_idx[(n_zero + 1):n]  # 이상치
+  
+  E <- matrix(0, nrow = n, ncol = p)  # 행렬 E 생성
+  E[outlier_idx, ] <- X[outlier_idx, ]  # 이상치 후보 E_i = X_i
+  
+  
+  # 2. Iterate
+  
+  objective_old <- NA_real_
+  
+  for (iter in 1:max_iter) {  # 수렴할 때까지 반복 ( max_iter = 1000 )
+    
+    X_clean <- X - E  # 관측치별 오차를 보정한 데이터
+    
+    svd_result <- svd(X_clean)  # SVD : X - E = UDV^T
+    
+    U <- svd_result$u[, 1:K, drop = FALSE]  # K개의 주성분만 사용
+    D <- diag(svd_result$d[1:K], nrow = K)
+    V <- svd_result$v[, 1:K, drop = FALSE]
+    
+    fitted <- U %*% D %*% t(V) # rank-K PCA 근사값
+    
+    # Update E_i
+    residual <- X - fitted  # E_i 업데이트 값
+    
+    for (i in 1:n) {
+      
+      residual_norm <- sqrt(sum(residual[i, ]^2))
+      
+      if (residual_norm == 0) {  # residual = 0
+        E[i, ] <- 0
+      } else {
+        
+        shrinkage <- max(  # residual ≠ 0 ( group lasso )
+          0,
+          1 - lambda / residual_norm
+        )
+        
+        E[i, ] <- residual[i, ] * shrinkage
+      }
+    }
+    
+    # Convergence check: 목적함수의 상대 변화량
+    objective <- 0.5 * sum((X - E - fitted)^2) +
+      lambda * sum(sqrt(rowSums(E^2)))
+    
+    if (!is.na(objective_old)) {
+      
+      relative_change <- abs(objective - objective_old) /
+        max(1, abs(objective_old))
+      
+      if (relative_change < tol) {
+        break
+      }
+    }
+    
+    objective_old <- objective
+  }
+  
+  
+  # 3. Identify zero-error observations
+
+  E_norm <- sqrt(rowSums(E^2))  # || E_i ||_2
+  
+  zero_error <- which(E_norm < tol)  # E_i = 0
+  outliers <- which(E_norm >= tol)  # E_i ≠ 0
+  
+  
+  # 4. Final PCA
+  
+  X_final <- X[zero_error, , drop = FALSE]  # 정상 관측치만
+  
+  final_svd <- svd(X_final)  # 정상 관측치에 대해 최종적으로 PCA
+  
+  V_final <- final_svd$v[, 1:K, drop = FALSE]  # 1 ~ K 번째 주성분
+  
+  
+  # Return
+  
+  return(list(
+    V = V_final,  # 주성분 
+    E = E,
+    outliers = outliers,  # 이상치로 판별된 관측치 번호
+    zero_error = zero_error,  # 정상 관측치 번호
+    n_outliers = length(outliers),  # 이상치 개수
+    iterations = iter,  # 반복 횟수
+    lambda = lambda  # 사용한 λ
+  ))
+}
+
+outlier_pca
+```
+
+
+# 2. Figure 4: 2차원 예제
+
+<span class="source">원본: figure 4.R · 논문: Figure 4</span>
+
+정상 관측치 50개와 직접 지정한 이상치 3개로 구성한 예제이다. K = 1, λ = 1로 설정한다. 일반 PCA는 X를, OPCA 결과는 보정한 X − E를 표시한다. 빨간색은 실제 이상치를 나타낸다. 논문 Figure 4의 원리를 확인하기 위한 별도 생성 데이터이다.
+
+```{r original-02, message=FALSE, warning=TRUE, fig.width=7, fig.height=5}
+
+# ============================================================
+# Figure 4 - 데이터 생성 및 PCA, OPCA 계산
+# ============================================================
+
+set.seed(123)
+
+# 1. 정상 관측치 50개
+n_normal <- 50
+
+x1 <- rnorm(n_normal, 0, 1)
+x2 <- x1 + rnorm(n_normal, 0, 0.3)
+
+normal_data <- cbind(x1, x2)
+
+# 2. 이상치 3개
+outliers <- matrix(
+  c(5, -4,
+    6, -3,
+    5, -5),
+  ncol = 2,
+  byrow = TRUE
+)
+
+X_2d <- rbind(normal_data, outliers)
+true_outliers <- 51:53
+
+
+# 3. 일반 PCA
+pca_result <- prcomp(
+  X_2d,
+  center = FALSE,
+  scale. = FALSE
+)
+
+pca_vector <- pca_result$rotation[, 1]
+
+if (pca_vector[1] < 0) {
+  pca_vector <- -pca_vector
+}
+
+
+# 4. OPCA
+opca_result <- outlier_pca(
+  X_2d,
+  K = 1,
+  lambda = 1
+)
+
+opca_outliers <- opca_result$outliers
+opca_normal <- opca_result$zero_error
+
+opca_vector <- opca_result$V[, 1]
+
+if (opca_vector[1] < 0) {
+  opca_vector <- -opca_vector
+}
+
+
+# 5. 이상치 보정
+X_adjusted <- X_2d - opca_result$E
+
+
+# ============================================================
+# Figure 4 - PCA와 OPCA 비교 (1행 × 3열)
+# ============================================================
+
+library(ggplot2)
+library(patchwork)
+
+
+# ------------------------------------------------------------
+# 1. 그래프 데이터 준비
+# ------------------------------------------------------------
+
+# 원본 데이터 X
+df_original <- data.frame(
+  x = X_2d[, 1],
+  y = X_2d[, 2],
+  type = ifelse(
+    1:nrow(X_2d) %in% true_outliers,
+    "Outlier",
+    "Non-outlier"
+  )
+)
+
+# 보정된 데이터 X - E
+df_adjusted <- data.frame(
+  x = X_adjusted[, 1],
+  y = X_adjusted[, 2],
+  type = ifelse(
+    1:nrow(X_adjusted) %in% true_outliers,
+    "Outlier",
+    "Non-outlier"
+  )
+)
+
+
+# ------------------------------------------------------------
+# 2. 세 그래프의 축 범위 통일
+# ------------------------------------------------------------
+
+x_limits <- range(
+  c(X_2d[, 1], X_adjusted[, 1])
+) + c(-0.5, 0.5)
+
+y_limits <- range(
+  c(X_2d[, 2], X_adjusted[, 2])
+) + c(-0.5, 0.5)
+
+
+# ------------------------------------------------------------
+# 3. 공통 그래프 설정
+# ------------------------------------------------------------
+
+common_style <- list(
+  scale_color_manual(
+    values = c(
+      "Non-outlier" = "black",
+      "Outlier" = "red"
+    )
+  ),
+  coord_equal(
+    xlim = x_limits,
+    ylim = y_limits,
+    expand = FALSE
+  ),
+  theme_minimal(),
+  labs(
+    x = "X1",
+    y = "X2",
+    color = "Type"
+  ),
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    )
+  )
+)
+
+
+# ------------------------------------------------------------
+# 4. Figure 4(a) - 일반 PCA / 원본 X
+# ------------------------------------------------------------
+
+p_a <- ggplot(
+  df_original,
+  aes(x = x, y = y, color = type)
+) +
+  geom_abline(
+    intercept = 0,
+    slope = pca_vector[2] / pca_vector[1],
+    linewidth = 1,
+    color = "black"
+  ) +
+  geom_point(size = 2.5) +
+  common_style +
+  labs(title = "(a) PCA - Original X")
+
+
+# ------------------------------------------------------------
+# 5. Figure 4(b) - OPCA / 원본 X
+# ------------------------------------------------------------
+
+p_b <- ggplot(
+  df_original,
+  aes(x = x, y = y, color = type)
+) +
+  geom_abline(
+    intercept = 0,
+    slope = opca_vector[2] / opca_vector[1],
+    linewidth = 1,
+    color = "black"
+  ) +
+  geom_point(size = 2.5) +
+  common_style +
+  labs(title = "(b) OPCA - Original X")
+
+
+# ------------------------------------------------------------
+# 6. Figure 4(c) - OPCA / 보정된 X - E
+# ------------------------------------------------------------
+
+p_c <- ggplot(
+  df_adjusted,
+  aes(x = x, y = y, color = type)
+) +
+  geom_abline(
+    intercept = 0,
+    slope = opca_vector[2] / opca_vector[1],
+    linewidth = 1,
+    color = "black"
+  ) +
+  geom_point(size = 2.5) +
+  common_style +
+  labs(title = "(c) OPCA - Adjusted X-E")
+
+
+# ------------------------------------------------------------
+# 7. 세 그래프를 1행 × 3열로 출력
+# ------------------------------------------------------------
+
+(p_a | p_b | p_c) +
+  plot_layout(
+    nrow = 1,
+    guides = "collect"
+  ) &
+  theme(
+    legend.position = "bottom"
+  )
+
+```
+
+
+# 3. 모의실험 데이터 생성
+
+<span class="source">원본: simulation study.R · 논문: 4.3절</span>
+
+정상 관측치 n개와 이상치 q개를 합쳐 N = n + q개의 5차원 관측치를 생성한다. U와 V의 두 열은 각각 정규직교하며, 마지막 q개 행에만 추가 오차 δ를 부여한다.
+
+<div class="formula">X<sub>ij</sub> = 50u<sub>i1</sub>v<sub>j1</sub> + 10u<sub>i2</sub>v<sub>j2</sub> + ε<sub>ij</sub> + δ<sub>ij</sub>1(i &gt; n)</div>
+
+εᵢⱼ ∼ N(0,1), δᵢⱼ ∼ Unif((−5,−3) ∪ (3,5))이다. `true_V`는 VSA 계산에 사용할 참 부분공간의 기저이다.
+
+```{r original-03, message=FALSE, warning=TRUE, fig.width=7, fig.height=5}
+
+
+# ============================================================
+# simulation data
+# ============================================================
+
+
+generate_pca_data <- function(n, q, p = 5) {  # n : 정상, q : 이상치, p : 변수
+  
+  N <- n + q  # 전체 관측치 N
+  
+  
+  # 1. U: (n+q) x 2 orthonormal matrix
+  
+  U_random <- matrix(
+    rnorm(N * 2),  # 두 잠재 성분의 왼쪽 특이벡터를 만들기 위한 난수
+    nrow = N,
+    ncol = 2
+  )
+  
+  U <- qr.Q(qr(U_random))  # 직교 행렬로 변환
+  
+  u1 <- U[, 1]
+  u2 <- U[, 2]
+  
+  
+  # 2. V: p x 2 orthonormal matrix
+  
+  V_random <- matrix(
+    rnorm(p * 2),
+    nrow = p,
+    ncol = 2
+  )
+  
+  V <- qr.Q(qr(V_random))
+  
+  v1 <- V[, 1]
+  v2 <- V[, 2]
+  
+  
+  # 3. True signal
+  
+  signal <- 50 * outer(u1, v1) + 10 * outer(u2, v2)
+  
+  
+  # 4. Gaussian noise : epsilon_ij ~ N(0,1)
+  
+  epsilon <- matrix(
+    rnorm(N * p, mean = 0, sd = 1),
+    nrow = N,
+    ncol = p
+  )
+  
+  
+  # 5. Outlier noise : delta_ij ~ Uniform[(-5,-3) U (3,5)]
+  
+  delta <- matrix(0, nrow = N, ncol = p)
+  
+  if (q > 0) {  # 이상치가 존재하는 경우
+    
+    signs <- sample(  # 이상치의 방향(음수, 양수)을 랜덤하게 결정
+      c(-1, 1),
+      size = q * p,
+      replace = TRUE
+    )
+    
+    magnitude <- runif(  # Unif(3, 5) 에서 난수 생성
+      q * p,
+      min = 3,  
+      max = 5
+    )
+    
+    delta[(n + 1):N, ] <- matrix( #  Unif( [-5, -3] U [3, 5] )
+      signs * magnitude,
+      nrow = q,
+      ncol = p
+    )
+  }
+  
+  
+  # 6. Observed data
+  
+  X <- signal + epsilon + delta
+  
+  
+  # Return
+  
+  list(
+    X = X,
+    true_V = V,  # 잡음 없는 신호를 생성한 참 주성분 부분공간의 기저
+    true_outliers = if (q > 0) (n + 1):N else integer(0),  # 실제 이상치 위치
+    true_nonoutliers = 1:n,  # 정상 관측치
+    n = n,
+    q = q,
+    p = p
+  )
+}
+
+
+```
+
+
+# 4. Table 2: 방법별 구현
+
+<span class="source">원본: table2.R · 논문: 4.1절 및 4.3절</span>
+
+
+## 4.1 일반 PCA 함수
+
+X의 SVD에서 앞의 K개 성분을 사용한다. U, 특잇값 D, 오른쪽 특이벡터 V를 반환한다.
+
+※ 원문에는 `reconstruct_rank2()` 내부에 동일한 함수 정의가 중첩되어 있어 그대로 수록했으며, 아래 모의실험 함수들은 이 복원 함수를 직접 호출하지 않는다.
+
+```{r original-04, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+
+
+#### 일반 PCA 함수 
+
+pca_rank2 <- function(X, K = 2) {
+  
+  svd_result <- svd(X, nu = K, nv = K)
+  
+  U <- svd_result$u[, 1:K, drop = FALSE]
+  D <- svd_result$d[1:K]
+  V <- svd_result$v[, 1:K, drop = FALSE]
+  
+  list(
+    U = U,
+    D = D,
+    V = V
+  )
+}
+
+reconstruct_rank2 <- function(pca_result) {  # PCA 결과 복원 함수
+  
+  pca_result$U %*%
+  reconstruct_rank2 <- function(pca_result) {
+      
+      K <- length(pca_result$D)
+      
+      pca_result$U %*%
+        diag(pca_result$D, nrow = K, ncol = K) %*%
+        t(pca_result$V)
+  } %*%
+  t(pca_result$V)
+}
+
+
+
+
+```
+
+
+## 4.2 VSA
+
+VSA = tr(P_true P_est) / 2이며, P = VVᵀ는 두 주성분이 생성하는 공간의 직교투영행렬이다. 1에 가까울수록 참 부분공간과 추정 부분공간이 일치한다.
+
+```{r original-05, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### VSA 
+
+
+calculate_vsa <- function(true_V, estimated_V) {
+  
+  P_true <- true_V %*% t(true_V)
+  P_est  <- estimated_V %*% t(estimated_V)
+  
+  vsa <- sum(diag(P_true %*% P_est)) / 2
+  
+  return(vsa)
+}
+
+
+```
+
+
+## 4.3 OER
+
+OER = (FN + FP) / N이다. 실제 이상치를 놓친 수와 정상 관측치를 이상치로 잘못 판정한 수를 전체 관측치 수로 나눈다.
+
+```{r original-06, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### OER
+
+
+calculate_oer <- function(estimated_outliers, true_outliers, N) {
+  
+  estimated_outliers <- sort(estimated_outliers)
+  true_outliers <- sort(true_outliers)
+  
+  false_negative <- sum(
+    !(true_outliers %in% estimated_outliers)  # 실제 이상친데 이상치 판정 X
+  )
+  
+  false_positive <- sum(
+    !(estimated_outliers %in% true_outliers)  # 실제 정상인데 이상치로 판정
+  )
+  
+  oer <- (false_negative + false_positive) / N
+  
+  return(oer)
+}
+
+
+```
+
+
+## 4.4 OPCA와 λ 선택
+
+고정된 λ에서 Algorithm 3을 수행한 후, 오차가 0인 관측치들의 잔차 norm dᵢ = ‖Xᵢ − UᵢDVᵀ‖₂를 사용한다. 이 집합에서 계산한 평균 m(λ)와 표준편차 s(λ)에 대해 모든 dᵢ ≤ m(λ) + 3s(λ)를 만족하는 가장 큰 후보 λ를 선택한다.
+
+코드에서는 초기 PCA 잔차 최대값 M부터 0.001M까지 100개 후보를 생성한다. 이는 후보 범위·개수에 대한 구현 설정이다. 반환되는 V는 정상 관측치로 최종 재적합한 방향이다.
+
+```{r original-07, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### OPCA
+
+
+# ------------------------------------------------------------
+# 1. 주어진 lambda에서 OPCA 알고리즘 수행
+# ------------------------------------------------------------
+
+opca_fixed_lambda <- function(X, lambda, K = 2,
+                              max_iter = 1000, tol = 1e-6) {
+  
+  N <- nrow(X)
+  p <- ncol(X)
+  
+  # 1-1. E 초기화
+  
+  overall_mean <- colMeans(X)  # 중심(평균) 계산
+  
+  distance_from_mean <- sqrt(rowSums(sweep(X, 2, overall_mean, "-")^2))  # 거리 계산
+  
+  n_initial <- ceiling(0.1 * N)  # 초기 이상치 : 10 %
+  
+  initial_outliers <- order(  # 평균에서 가장 먼 10 %
+    distance_from_mean,
+    decreasing = TRUE
+  )[1:n_initial]
+  
+  E <- matrix(0, nrow = N, ncol = p)  # E 생성
+  
+  E[initial_outliers, ] <- X[initial_outliers, ]  # E_i = X_i
+  
+  # 1-2. 반복 알고리즘
+  
+  objective_old <- NA_real_
+  converged <- FALSE
+  
+  for (iter in seq_len(max_iter)) {
+    
+    svd_result <- svd(X - E, nu = K, nv = K)
+    
+    U <- svd_result$u[, seq_len(K), drop = FALSE]
+    D <- svd_result$d[seq_len(K)]
+    V <- svd_result$v[, seq_len(K), drop = FALSE]
+    
+    fitted <- U %*%
+      diag(D, nrow = K, ncol = K) %*%
+      t(V)
+    
+    residual <- X - fitted
+    residual_norm <- sqrt(rowSums(residual^2))
+    
+    shrinkage <- pmax(
+      0,
+      1 - lambda / pmax(residual_norm, 1e-12)
+    )
+    
+    E <- residual * shrinkage
+    
+    objective <- 0.5 * sum((X - E - fitted)^2) +
+      lambda * sum(sqrt(rowSums(E^2)))
+    
+    if (!is.na(objective_old)) {
+      
+      relative_change <- abs(objective - objective_old) /
+        max(1, abs(objective_old))
+      
+      if (relative_change < tol) {
+        converged <- TRUE
+        break
+      }
+    }
+    
+    objective_old <- objective
+  }
+  
+  # 1-3. 최종 outlier 판정
+  
+  E_norm <- sqrt(rowSums(E^2))
+  
+  outliers <- which(E_norm > tol)
+  
+  nonoutliers <- which(E_norm <= tol)
+
+  # 1-4. zero-error observations에 대해 최종 PCA
+  
+  if (length(nonoutliers) >= K && p >= K) {
+    
+    X_clean <- X[
+      nonoutliers,
+      ,
+      drop = FALSE
+    ]
+    
+    final_pca <- pca_rank2(  # 정상 데이터만 PCA
+      X_clean,
+      K = K
+    )
+    
+    V_final <- final_pca$V
+    U_final <- final_pca$U
+    D_final <- final_pca$D
+    
+  } else {
+    
+    V_final <- matrix(
+      NA_real_,
+      nrow = p,
+      ncol = K
+    )
+    
+    U_final <- matrix(
+      NA_real_,
+      nrow = N,
+      ncol = K
+    )
+    
+    D_final <- rep(
+      NA_real_,
+      K
+    )
+  }
+  
+  # 1-5. 최종 residual 계산
+  
+  residual <- X - fitted
+  
+  residual_norm <- sqrt(rowSums(residual^2))
+  
+  # 1-6. 결과 반환
+  
+  list(
+    E = E,
+    U = U_final,
+    D = D_final,
+    V = V_final,
+    E_norm = E_norm,
+    residual_norm = residual_norm,
+    outliers = outliers,
+    nonoutliers = nonoutliers,
+    qhat = length(outliers),
+    converged = converged,
+    objective = objective,
+    iterations = iter
+  )
+}
+
+
+# ------------------------------------------------------------
+# 2. Lambda 후보 생성
+# ------------------------------------------------------------
+
+make_lambda_grid <- function(X, K = 2, n_lambda = 100) {
+  
+  # E = 0인 상태에서 X의 rank-K SVD
+  svd_result <- svd(
+    X,
+    nu = K,
+    nv = K
+  )
+  
+  U <- svd_result$u[, 1:K, drop = FALSE]
+  D <- svd_result$d[1:K]
+  V <- svd_result$v[, 1:K, drop = FALSE]
+  
+  # rank-K approximation
+  fitted <- U %*% diag(D, nrow = K, ncol = K) %*% t(V)
+  
+  # 각 관측치의 초기 PCA residual
+  residual <- X - fitted
+  
+  residual_norm <- sqrt(rowSums(residual^2))
+  
+  # 모든 E_i가 0이 되는 경계값
+  max_lambda <- max(residual_norm)
+  
+  # 0에 너무 가까운 값은 피함
+  min_lambda <- max_lambda * 0.001
+  
+  seq(
+    max_lambda,
+    min_lambda,
+    length.out = n_lambda
+  )
+}
+
+
+# ------------------------------------------------------------
+# 3. Lambda 선택
+# ------------------------------------------------------------
+
+select_opca_lambda <- function(
+    X,
+    K = 2,
+    n_lambda = 100,
+    max_iter = 1000,
+    tol = 1e-6
+) {
+  
+  lambda_grid <- make_lambda_grid(
+    X,
+    K = K,
+    n_lambda = n_lambda
+  )
+  
+  lambda_grid <- sort(
+    unique(lambda_grid),
+    decreasing = TRUE
+  )
+  
+  for (lambda in lambda_grid) {
+    
+    result <- opca_fixed_lambda(
+      X = X,
+      lambda = lambda,
+      K = K,
+      max_iter = max_iter,
+      tol = tol
+    )
+
+    if (!isTRUE(result$converged)) {
+      stop(
+        sprintf(
+          "lambda = %.6g에서 OPCA가 수렴하지 않았습니다. max_iter를 늘려 확인하세요.",
+          lambda
+        )
+      )
+    }
+
+    if (length(result$nonoutliers) < max(K, 2L)) {
+      next
+    }
+    
+    if (!all(is.finite(result$V))) {
+      next
+    }
+    
+    residual_clean <- result$residual_norm[
+      result$nonoutliers
+    ]
+    
+    if (!all(is.finite(residual_clean))) {
+      next
+    }
+    
+    m <- mean(residual_clean)
+    s <- sd(residual_clean)
+    threshold <- m + 3 * s
+    
+    if (all(residual_clean <= threshold)) {
+      
+      result$lambda <- lambda
+      result$mean_residual <- m
+      result$sd_residual <- s
+      result$threshold <- threshold
+      
+      return(result)
+    }
+  }
+  
+  stop(
+    "현재 lambda 후보 중 선택 기준과 계산 조건을 만족하는 값이 없습니다. 후보 범위와 간격을 확인하세요."
+  )
+}
+  
+
+# ------------------------------------------------------------
+# 4. 최종 OPCA 함수
+# ------------------------------------------------------------
+
+opca <- function(
+    X,
+    K = 2,
+    n_lambda = 100,
+    max_iter = 1000,
+    tol = 1e-6
+) {
+  
+  result <- select_opca_lambda(
+    X = X,
+    K = K,
+    n_lambda = n_lambda,
+    max_iter = max_iter,
+    tol = tol
+  )
+  
+  return(result)
+}
+
+
+```
+
+
+## 4.5 OSPCA
+
+각 관측치에서 다른 관측치까지의 평균 유클리드 거리를 계산한다. 평균 거리가 가장 큰 q̂개를 제외한 후 PCA를 수행한다. q̂는 같은 데이터에서 OPCA가 판정한 이상치 수이다.
+
+```{r original-08, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### OSPCA
+
+
+ospca <- function(X, qhat, K = 2) {
+  
+  N <- nrow(X)
+  
+  # 1. 모든 관측치 사이의 Euclidean distance 계산
+  
+  distance_matrix <- as.matrix(
+    dist(X, method = "euclidean")
+  )
+  
+  diag(distance_matrix) <- NA
+  
+  # 2. 각 관측치와 다른 관측치들의 평균 거리
+  
+  mean_distance <- rowMeans(
+    distance_matrix,
+    na.rm = TRUE
+  )
+  
+  # 3. 평균 거리가 가장 큰 qhat개를 outlier로 지정
+  
+  if (qhat == 0) {
+    
+    estimated_outliers <- integer(0)
+    
+  } else {
+    
+    estimated_outliers <- order(
+      mean_distance,
+      decreasing = TRUE
+    )[1:qhat]
+  }
+  
+  # 4. outlier를 제외한 관측치
+  
+  keep <- setdiff(
+    seq_len(N),
+    estimated_outliers
+  )
+  
+  X_clean <- X[
+    keep,
+    ,
+    drop = FALSE
+  ]
+  
+  # 5. 남은 관측치에 PCA
+  
+  pca_result <- pca_rank2(
+    X_clean,
+    K = K
+  )
+  
+  # 6. 결과 반환
+  
+  return(
+    list(
+      V = pca_result$V,
+      U = pca_result$U,
+      D = pca_result$D,
+      outliers = estimated_outliers,
+      qhat = qhat,
+      mean_distance = mean_distance,
+      keep = keep
+    )
+  )
+}
+
+
+```
+
+
+## 4.6 PCAOS
+
+전체 데이터의 PCA를 먼저 계산한다. rank-K 근사의 잔차 norm이 큰 q̂개를 이상치로 판정하며, 이후 주성분을 재적합하지 않는다.
+
+```{r original-09, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### PCAOS
+
+pcaos <- function(X, qhat, K = 2) {
+  
+  N <- nrow(X)
+  
+  # 1. 전체 데이터에 PCA
+  
+  pca_result <- pca_rank2(
+    X,
+    K = K
+  )
+  
+  U <- pca_result$U
+  D <- pca_result$D
+  V <- pca_result$V
+  
+  # 2. Rank-K approximation
+  
+  fitted <- U %*%
+    diag(D, nrow = K, ncol = K) %*%
+    t(V)
+  
+  # 3. 각 관측치의 reconstruction error
+  
+  reconstruction_error <- sqrt(
+    rowSums(
+      (X - fitted)^2
+    )
+  )
+  
+  # 4. error가 가장 큰 qhat개를 outlier로 지정
+  
+  if (qhat == 0) {
+    
+    estimated_outliers <- integer(0)
+    
+  } else {
+    
+    estimated_outliers <- order(
+      reconstruction_error,
+      decreasing = TRUE
+    )[1:qhat]
+  }
+  
+  # 5. 결과 반환
+  
+  return(
+    list(
+      V = V,
+      U = U,
+      D = D,
+      outliers = estimated_outliers,
+      qhat = qhat,
+      reconstruction_error = reconstruction_error
+    )
+  )
+}
+
+
+```
+
+
+## 4.7 일반 PCA 실행 함수
+
+공통 PCA 함수를 호출하고 U, D, V를 반환한다.
+
+```{r original-10, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### 일반 PCA
+
+
+pca_method <- function(X, K = 2) {
+  
+  result <- pca_rank2(
+    X,
+    K = K
+  )
+  
+  return(
+    list(
+      V = result$V,
+      U = result$U,
+      D = result$D
+    )
+  )
+}
+
+
+```
+
+
+# 5. 모의실험 실행
+
+## 5.1 한 번의 모의실험
+
+같은 데이터셋에 PCA, OPCA, OSPCA, PCAOS를 적용한다. 각 방법의 VSA와 이상치를 판정하는 세 방법의 OER을 계산하여 한 행으로 반환한다.
+
+```{r original-11, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+# ============================================================
+# 한 번의 Simulation
+# ============================================================
+
+
+run_one_simulation <- function(
+    n,
+    q,
+    p = 5,
+    K = 2
+) {
+  
+  # 1. 데이터 생성
+  
+  data <- generate_pca_data(
+    n = n,
+    q = q,
+    p = p
+  )
+  
+  X <- data$X
+  true_V <- data$true_V
+  true_outliers <- data$true_outliers
+  
+  N <- nrow(X)
+  
+  # 2. PCA
+  
+  pca_result <- pca_method(
+    X,
+    K = K
+  )
+  
+  pca_vsa <- calculate_vsa(
+    true_V,
+    pca_result$V
+  )
+  
+  # 3. OPCA
+  
+  opca_result <- opca(
+    X,
+    K = K
+  )
+  
+  opca_vsa <- calculate_vsa(
+    true_V,
+    opca_result$V
+  )
+  
+  opca_oer <- calculate_oer(
+    estimated_outliers = opca_result$outliers,
+    true_outliers = true_outliers,
+    N = N
+  )
+  
+  qhat <- opca_result$qhat # OPCA가 추정한 qhat
+  
+  # 4. OSPCA
+  
+  ospca_result <- ospca(
+    X,
+    qhat = qhat,
+    K = K
+  )
+  
+  ospca_vsa <- calculate_vsa(
+    true_V,
+    ospca_result$V
+  )
+  
+  ospca_oer <- calculate_oer(
+    estimated_outliers = ospca_result$outliers,
+    true_outliers = true_outliers,
+    N = N
+  )
+  
+  # 5. PCAOS
+  
+  pcaos_result <- pcaos(
+    X,
+    qhat = qhat,
+    K = K
+  )
+  
+  pcaos_vsa <- calculate_vsa(
+    true_V,
+    pcaos_result$V
+  )
+  
+  pcaos_oer <- calculate_oer(
+    estimated_outliers = pcaos_result$outliers,
+    true_outliers = true_outliers,
+    N = N
+  )
+  
+  # 6. 결과 저장
+  
+  return(
+    data.frame(
+      n = n,
+      q = q,
+      qhat = qhat,
+      
+      PCA_VSA = pca_vsa,
+      
+      OPCA_VSA = opca_vsa,
+      OPCA_OER = opca_oer,
+      
+      OSPCA_VSA = ospca_vsa,
+      OSPCA_OER = ospca_oer,
+      
+      PCAOS_VSA = pcaos_vsa,
+      PCAOS_OER = pcaos_oer
+    )
+  )
+}
+
+
+```
+
+
+## 5.2 50회 반복
+
+한 조건에서 모의실험을 50회 반복하고, 각 반복의 결과를 행으로 결합한다.
+
+```{r original-12, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+# ============================================================
+# 50회 Simulation
+# ============================================================
+
+
+run_simulation <- function(
+    n,
+    q,
+    p = 5,
+    K = 2,
+    B = 50
+) {
+  
+  results <- vector(
+    "list",
+    B
+  )
+  
+  
+  for (b in 1:B) {
+    
+    cat(
+      "Simulation",
+      b,
+      "/",
+      B,
+      "\n"
+    )
+    
+    results[[b]] <- run_one_simulation(
+      n = n,
+      q = q,
+      p = p,
+      K = K
+    )
+  }
+  
+  
+  results <- do.call(
+    rbind,
+    results
+  )
+  
+  
+  return(results)
+}
+
+
+```
+
+
+## 5.3 평균과 표준오차
+
+반복 결과의 평균과 SE = SD / √B를 계산한다. B는 반복 수이며, 여기서는 조건별 50회이다.
+
+```{r original-13, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+# ============================================================
+# 평균과 Standard Error
+# ============================================================
+
+
+mean_se <- function(x) {
+  
+  # 평균과 표준오차를 계산할 수 있는지 확인
+  if (length(x) < 2L) {
+    stop("표준오차를 계산하려면 결과가 2개 이상 필요합니다.")
+  }
+  
+  if (any(!is.finite(x))) {
+    stop("결과에 NA, NaN 또는 Inf가 있습니다. 모의실험 결과를 확인하세요.")
+  }
+  
+  mean_value <- mean(x)
+  
+  se_value <- sd(x) / sqrt(length(x))
+  
+  return(
+    c(
+      mean = mean_value,
+      se = se_value
+    )
+  )
+}
+
+
+```
+
+
+## 5.4 n = 50
+
+시드를 123으로 설정하고 q = 0, 5, 10 조건을 각각 50회 실행한다. 아래 실행 진행 메시지는 생략하였다.
+
+```{r original-14, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### n = 50 
+
+
+set.seed(123)
+
+result_50_0 <- run_simulation(  # q = 0
+  n = 50,
+  q = 0,
+  p = 5,
+  K = 2,
+  B = 50
+)
+
+result_50_5 <- run_simulation(  # q = 5
+  n = 50,
+  q = 5,
+  p = 5,
+  K = 2,
+  B = 50
+)
+
+result_50_10 <- run_simulation(  # q = 10
+  n = 50,
+  q = 10,
+  p = 5,
+  K = 2,
+  B = 50
+)
+
+
+```
+
+
+## 5.5 n = 100
+
+같은 난수 흐름에서 q = 0, 5, 10 조건을 각각 50회 실행한다.
+
+```{r original-15, message=FALSE, warning=TRUE, fig.width=7, fig.height=5, results="hide"}
+#### n = 100
+
+
+result_100_0 <- run_simulation( # q = 0
+  n = 100,
+  q = 0,
+  p = 5,
+  K = 2,
+  B = 50
+)
+
+result_100_5 <- run_simulation(  # q = 5
+  n = 100,
+  q = 5,
+  p = 5,
+  K = 2,
+  B = 50
+)
+
+result_100_10 <- run_simulation(  # q = 10
+  n = 100,
+  q = 10,
+  p = 5,
+  K = 2,
+  B = 50
+)
+
+
+```
+
+
+# 6. 결과 요약과 표
+
+<span class="source">원본: table 2 result.R · 논문: Table 2</span>
+
+앞에서 실행한 반복별 결과로 평균과 표준오차를 계산한다. 표의 괄호 안은 표준오차이며, 숫자를 직접 입력하지 않고 계산 결과를 표시한다.
+
+
+## 6.1 요약 함수
+
+각 지표의 평균과 표준오차를 계산하고, 필요한 열과 유효한 숫자가 존재하는지 확인한다.
+
+```{r original-16, message=FALSE, warning=TRUE, fig.width=7, fig.height=5}
+# ============================================================
+# Simulation 결과 요약 함수
+# ============================================================
+
+
+summarize_result <- function(result) {
+  
+  # 요약할 열: 기존 출력 순서 유지
+  metrics <- c(
+    "qhat",
+    "PCA_VSA",
+    "OPCA_VSA",
+    "OSPCA_VSA",
+    "PCAOS_VSA",
+    "OPCA_OER",
+    "OSPCA_OER",
+    "PCAOS_OER"
+  )
+  
+  missing_columns <- setdiff(metrics, names(result))
+  
+  if (length(missing_columns) > 0L) {
+    stop(
+      "결과에 필요한 열이 없습니다: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+  
+  summary_values <- list()
+  
+  for (metric in metrics) {
+    
+    values <- result[[metric]]
+    
+    if (!is.numeric(values) || any(!is.finite(values))) {
+      stop(
+        metric,
+        " 열에 숫자가 아닌 값, NA, NaN 또는 Inf가 있습니다."
+      )
+    }
+    
+    stats <- mean_se(values)
+    
+    summary_values[[paste0(metric, "_mean")]] <-
+      unname(stats["mean"])
+    
+    summary_values[[paste0(metric, "_se")]] <-
+      unname(stats["se"])
+  }
+  
+  as.data.frame(summary_values)
+}
+
+
+```
+
+
+## 6.2 전체 결과
+
+여섯 조건의 요약값을 하나의 표로 결합한다.
+
+```{r original-17, message=FALSE, warning=TRUE, fig.width=7, fig.height=5}
+# ============================================================
+# 전체 Simulation 결과
+# ============================================================
+
+
+summary_50_0 <- summarize_result(result_50_0)
+summary_50_5 <- summarize_result(result_50_5)
+summary_50_10 <- summarize_result(result_50_10)
+
+summary_100_0 <- summarize_result(result_100_0)
+summary_100_5 <- summarize_result(result_100_5)
+summary_100_10 <- summarize_result(result_100_10)
+
+
+table_summary <- rbind(
+  cbind(n = 50, q = 0, summary_50_0),
+  cbind(n = 50, q = 5, summary_50_5),
+  cbind(n = 50, q = 10, summary_50_10),
+  cbind(n = 100, q = 0, summary_100_0),
+  cbind(n = 100, q = 5, summary_100_5),
+  cbind(n = 100, q = 10, summary_100_10)
+)
+
+rownames(table_summary) <- NULL
+
+table_summary
+
+
+```
+
+
+## 6.3 VSA 표시 표
+
+각 방법의 VSA와 q̂를 평균(표준오차) 형식으로 표시한다.
+
+```{r original-19, message=FALSE, warning=TRUE, fig.width=7, fig.height=5}
+# ============================================================
+# Table 2 형식으로 VSA 표시
+# ============================================================
+
+
+format_mean_se <- function(mean_value, se_value) {
+  
+  paste0(
+    sprintf("%.3f", mean_value),
+    " (",
+    sprintf("%.3f", se_value),
+    ")"
+  )
+}
+
+
+table2_vsa <- data.frame(
+  
+  n = table_summary$n,
+  
+  q = table_summary$q,
+  
+  qhat = format_mean_se(
+    table_summary$qhat_mean,
+    table_summary$qhat_se
+  ),
+  
+  PCA = format_mean_se(
+    table_summary$PCA_VSA_mean,
+    table_summary$PCA_VSA_se
+  ),
+  
+  OPCA = format_mean_se(
+    table_summary$OPCA_VSA_mean,
+    table_summary$OPCA_VSA_se
+  ),
+  
+  OSPCA = format_mean_se(
+    table_summary$OSPCA_VSA_mean,
+    table_summary$OSPCA_VSA_se
+  ),
+  
+  PCAOS = format_mean_se(
+    table_summary$PCAOS_VSA_mean,
+    table_summary$PCAOS_VSA_se
+  )
+)
+
+table2_vsa
+
+
+```
+
+
+## 6.4 OER 표시 표
+
+OPCA, OSPCA, PCAOS의 OER을 평균(표준오차) 형식으로 표시한다. 일반 PCA는 이상치를 판정하지 않으므로 제외한다.
+
+```{r original-20, message=FALSE, warning=TRUE, fig.width=7, fig.height=5}
+# ============================================================
+# OER 결과
+# ============================================================
+
+
+table2_oer <- data.frame(
+  
+  n = table_summary$n,
+  
+  q = table_summary$q,
+  
+  OPCA = format_mean_se(
+    table_summary$OPCA_OER_mean,
+    table_summary$OPCA_OER_se
+  ),
+  
+  OSPCA = format_mean_se(
+    table_summary$OSPCA_OER_mean,
+    table_summary$OSPCA_OER_se
+  ),
+  
+  PCAOS = format_mean_se(
+    table_summary$PCAOS_OER_mean,
+    table_summary$PCAOS_OER_se
+  )
+)
+
+table2_oer
+
+
+```
+
+
+## 6.5 기본 검수
+
+여섯 조건의 반복 수, 유효한 값, 지표 범위 및 PCA와 PCAOS의 VSA 일치 여부를 확인한다.
+
+```{r original-21, message=FALSE, warning=TRUE, fig.width=7, fig.height=5}
+# ============================================================
+# 기본 검수: 6개 조건
+# ============================================================
+
+
+all_results <- list(
+  result_50_0 = result_50_0,
+  result_50_5 = result_50_5,
+  result_50_10 = result_50_10,
+  result_100_0 = result_100_0,
+  result_100_5 = result_100_5,
+  result_100_10 = result_100_10
+)
+
+expected_n <- c(50, 50, 50, 100, 100, 100)
+expected_q <- c(0, 5, 10, 0, 5, 10)
+
+vsa_columns <- c(
+  "PCA_VSA",
+  "OPCA_VSA",
+  "OSPCA_VSA",
+  "PCAOS_VSA"
+)
+
+oer_columns <- c(
+  "OPCA_OER",
+  "OSPCA_OER",
+  "PCAOS_OER"
+)
+
+check_tol <- 1e-10
+
+for (i in seq_along(all_results)) {
+  
+  result_name <- names(all_results)[i]
+  res <- all_results[[i]]
+  
+  # 검수 실패 시 어느 조건인지 표시
+  check <- function(condition, message) {
+    if (!isTRUE(condition)) {
+      stop(result_name, ": ", message)
+    }
+  }
+  
+  # 1. 조건별 50회 결과인지 확인
+  check(
+    nrow(res) == 50L,
+    "반복 결과가 50개가 아닙니다."
+  )
+  
+  # 2. 모든 결과가 유한한 숫자인지 확인
+  check(
+    all(vapply(
+      res,
+      function(x) is.numeric(x) && all(is.finite(x)),
+      logical(1)
+    )),
+    "숫자가 아닌 값, NA, NaN 또는 Inf가 있습니다."
+  )
+  
+  # 3. 실험 조건이 올바르게 저장되었는지 확인
+  check(
+    all(res$n == expected_n[i]) &&
+      all(res$q == expected_q[i]),
+    "저장된 n 또는 q가 예상 조건과 다릅니다."
+  )
+  
+  # 4. qhat이 가능한 범위의 정수인지 확인
+  check(
+    all(
+      res$qhat >= 0 &
+        res$qhat <= res$n + res$q &
+        res$qhat == floor(res$qhat)
+    ),
+    "qhat이 가능한 범위의 정수가 아닙니다."
+  )
+  
+  # 5. VSA와 OER이 0~1 범위인지 확인
+  # 부동소수점 계산의 미세한 오차는 허용
+  for (metric in c(vsa_columns, oer_columns)) {
+    
+    values <- res[[metric]]
+    
+    check(
+      all(
+        values >= -check_tol &
+          values <= 1 + check_tol
+      ),
+      paste0(metric, " 값이 0~1 범위를 벗어납니다.")
+    )
+  }
+  
+  # 6. PCAOS는 PCA 방향을 그대로 사용하므로 VSA가 같아야 함
+  check(
+    all(abs(res$PCA_VSA - res$PCAOS_VSA) < check_tol),
+    "PCA와 PCAOS의 VSA가 다릅니다."
+  )
+  
+  # 7. 실제 이상치가 없으면 OER = qhat / N
+  # 세 방법이 같은 개수 qhat을 판정하므로 모두 같아야 함
+  if (expected_q[i] == 0) {
+    
+    expected_oer <- res$qhat / (res$n + res$q)
+    
+    for (metric in oer_columns) {
+      
+      check(
+        all(abs(res[[metric]] - expected_oer) < check_tol),
+        paste0(metric, " 값이 qhat / N과 다릅니다.")
+      )
+    }
+  }
+  
+  cat(result_name, ": 검수 통과\n")
+}
+
+
+```
+
+
+# 7. 실제 다변량 자료의 PCA / OPCA 비교
+
+<span class="source">자료: track_m.csv · track_w.csv</span>
+
+국가별 남녀 육상 기록 자료에 PCA와 OPCA를 적용한다. 국가명을 제외한 기록 변수를 표준화하며, 주성분은 두 개(K = 2)로 설정한다.
+
+## 7.1 자료 및 분석 설정
+
+```{r track-01, message=FALSE, warning=TRUE}
+# ============================================================
+# 실제 데이터 PCA / OPCA 비교
+# ============================================================
+
+set.seed(123)
+
+K <- 2
+B <- 30
+
+track_m <- read.csv("/Users/hee/Downloads/track_m.csv", check.names = FALSE)
+track_w <- read.csv("/Users/hee/Downloads/track_w.csv", check.names = FALSE)
+
+datasets <- list(track_m = track_m, track_w = track_w)
+
+# 시각화에 필요한 결과 저장
+plot_data <- list()
+```
+
+## 7.2 비교 방법
+
+- **A. 원본 전체 자료:** OPCA의 이상치 탐지 결과와 PCA·OPCA 주성분 공간 일치도 비교
+- **B. 원본 검증:** 학습 44개국, 검증 11개국으로 나누어 재구성 MSE 비교
+- **C. 이상치 발생 후 검증:** 학습 자료의 3개국 기록을 변형하고, 같은 검증 자료에서 MSE·주성분 안정성·탐지율 계산
+
+<div class="formula">MSE = ‖X<sub>test</sub> − X<sub>test</sub>VVᵀ‖<sub>F</sub>² / (n<sub>test</sub>p)</div>
+
+- **MSE:** 검증 자료의 재구성 오차(작을수록 좋음)
+- **Stability:** 이상치 발생 전후 주성분 공간의 일치도(1에 가까울수록 안정적)
+- **Detection:** 변형한 3개 관측치 중 OPCA가 탐지한 비율
+- **New_detection:** 변형 전에는 탐지되지 않았으나 변형 후 탐지된 비율
+
+실험은 30회 반복한다. 일반 PCA에는 자체적인 이상치 탐지 기능이 없으므로 Detection은 OPCA만 계산한다.
+
+## 7.3 PCA / OPCA 분석 실행
+
+```{r track-02, message=FALSE, warning=TRUE}
+for (name in names(datasets)) {
+  
+  data <- datasets[[name]]
+  X <- as.matrix(data[, -1])
+  rownames(X) <- data$Country
+  
+  
+  # ==========================================================
+  # A. 원본 전체자료 PCA / OPCA
+  # ==========================================================
+  
+  X_scaled <- scale(X)
+  
+  V_pca <- svd(X_scaled)$v[, 1:K, drop = FALSE]
+  
+  lambda <- select_opca_lambda(X_scaled, K = K)$lambda
+  opca_result <- outlier_pca(X_scaled, K = K, lambda = lambda)
+  
+  V_opca <- opca_result$V
+  
+  cat("\nA. 원본 자료:", name, "\n")
+  cat("lambda:", lambda, "\n")
+  cat("이상치 개수:", opca_result$n_outliers, "\n")
+  print(rownames(X)[opca_result$outliers])
+  
+  agreement <- sum(crossprod(V_pca, V_opca)^2) / K
+  cat("PCA / OPCA 주성분 일치도:", agreement, "\n")
+  
+  # 원본 자료 시각화 결과 저장
+  scores <- X_scaled %*% V_pca
+  flag <- seq_len(nrow(X_scaled)) %in% opca_result$outliers
+  
+  
+  # ==========================================================
+  # B. 원본 검증 / C. 이상치 추가 후 검증
+  # ==========================================================
+  
+  results <- matrix(NA, nrow = B, ncol = 8)
+  
+  colnames(results) <- c(
+    "Original_PCA", "Original_OPCA",
+    "Dirty_PCA", "Dirty_OPCA",
+    "PCA_stability", "OPCA_stability",
+    "Detection", "New_detection"
+  )
+  
+  detected <- matrix(FALSE, nrow = B, ncol = 3)
+  
+  for (b in 1:B) {
+    
+    # 1. 학습 44개국 / 검증 11개국
+    train_idx <- sample(1:nrow(X), 44)
+    
+    train <- X[train_idx, , drop = FALSE]
+    test <- X[-train_idx, , drop = FALSE]
+    
+    mu <- colMeans(train)
+    s <- apply(train, 2, sd)
+    
+    train <- scale(train, center = mu, scale = s)
+    test <- scale(test, center = mu, scale = s)
+    
+    
+    # B. 원본 데이터 분석
+    Vp0 <- svd(train)$v[, 1:K, drop = FALSE]
+    
+    lambda0 <- select_opca_lambda(train, K = K)$lambda
+    op0 <- outlier_pca(train, K = K, lambda = lambda0)
+    Vo0 <- op0$V
+    
+    
+    # C. 이상치 3개 추가
+    injected <- sample(1:nrow(train), 3)
+    
+    noise <- matrix(
+      sample(c(-1, 1), 3 * ncol(train), replace = TRUE) *
+        runif(3 * ncol(train), 3, 5),
+      nrow = 3
+    )
+    
+    dirty <- train
+    dirty[injected, ] <- dirty[injected, ] + noise
+    
+    Vp1 <- svd(dirty)$v[, 1:K, drop = FALSE]
+    
+    lambda1 <- select_opca_lambda(dirty, K = K)$lambda
+    op1 <- outlier_pca(dirty, K = K, lambda = lambda1)
+    Vo1 <- op1$V
+    
+    # 인위적 이상치 탐지 여부 저장
+    detected[b, ] <- injected %in% op1$outliers
+    
+    
+    # 성능 평가
+    mse <- function(V) {
+      mean((test - test %*% V %*% t(V))^2)
+    }
+    
+    results[b, ] <- c(
+      mse(Vp0),
+      mse(Vo0),
+      mse(Vp1),
+      mse(Vo1),
+      sum(crossprod(Vp0, Vp1)^2) / K,
+      sum(crossprod(Vo0, Vo1)^2) / K,
+      length(intersect(injected, op1$outliers)) / 3,
+      length(setdiff(intersect(injected, op1$outliers),
+                     op0$outliers)) / 3
+    )
+  }
+  
+  
+  # ==========================================================
+  # 결과 출력
+  # ==========================================================
+  
+  cat("\nB/C. 30회 반복 결과:", name, "\n")
+  
+  print(round(colMeans(results), 4))
+  
+  cat("원본 OPCA 승률:",
+      mean(results[, 2] < results[, 1]), "\n")
+  
+  cat("이상치 추가 후 OPCA 승률:",
+      mean(results[, 4] < results[, 3]), "\n")
+  
+  
+  # ==========================================================
+  # 시각화용 자료 저장
+  # ==========================================================
+  
+  plot_data[[name]] <- list(
+    scores = scores,
+    flag = flag,
+    countries = rownames(X),
+    results = results,
+    detected = detected
+  )
+}
+```
+
+## 7.4 결과 요약
+
+**A. 원본 자료**
+
+| 자료 | 선택된 λ | 탐지 이상치 | PCA / OPCA 일치도 |
+|:--|--:|:--|--:|
+| 남자 | 1.3869 | 0개 | 1.0000 |
+| 여자 | 1.3621 | 3개 (`korea_n`, `mauritiu`, `wsamoa`) | 0.9732 |
+
+이상치로 *탐지된 후보*이며, 실제 이상치 여부가 확인된 것은 아니다.
+
+**B·C. 검증 자료의 평균 재구성 MSE (30회)**
+
+| 자료 | 학습 자료 조건 | PCA | OPCA |
+|:--|:--|--:|--:|
+| 남자 | 원본 | 0.0851 | 0.0845 |
+| 남자 | 3개국 변형 | 0.2387 | 0.1589 |
+| 여자 | 원본 | 0.1382 | 0.1311 |
+| 여자 | 3개국 변형 | 0.2629 | 0.1882 |
+
+원본에서는 MSE가 비슷했지만, 인위적 이상치 발생 후에는 남녀 모두 OPCA의 평균 MSE가 낮았다(30회 중 27회).
+
+**C. 주성분 안정성 및 이상치 탐지율 (30회 평균)**
+
+| 지표 | 남자 | 여자 |
+|:--|--:|--:|
+| PCA stability | 0.5649 | 0.6217 |
+| OPCA stability | 0.6875 | 0.7169 |
+| Detection | 0.6889 | 0.5889 |
+| New_detection | 0.6778 | 0.5667 |
+
+OPCA는 변형 사례 90건 중 남자 62건, 여자 53건을 탐지했고, 두 자료 모두 PCA보다 주성분 안정성이 높았다.
+
+## 7.5 결과 시각화
+
+- **그림 1:** 원본 PCA 산점도와 OPCA 이상치 후보
+- **그림 2:** 이상치 발생 후 PCA·OPCA의 반복별 검증 MSE
+- **그림 3:** 인위적으로 변형한 관측치 3개의 탐지 여부(30회)
+
+```{r track-03, message=FALSE, warning=TRUE, fig.width=11, fig.height=13, fig.align='center'}
+# ============================================================
+# 시각화 - 남녀 데이터 각각 비교
+# ============================================================
+
+draw_plots <- function() {
+  
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  
+  par(
+    mfrow = c(3, 2),
+    mar = c(4, 4, 3, 1)
+  )
+  
+  
+  # ==========================================================
+  # 그림 1. 원본 데이터 PCA 산점도
+  # ==========================================================
+  
+  for (name in names(datasets)) {
+    
+    d <- plot_data[[name]]
+    
+    xmin <- min(d$scores[, 1])
+    xmax <- max(d$scores[, 1])
+    xpad <- 0.15 * (xmax - xmin)
+    
+    ymin <- min(d$scores[, 2])
+    ymax <- max(d$scores[, 2])
+    ypad <- 0.15 * (ymax - ymin)
+    
+    plot(
+      d$scores[, 1],
+      d$scores[, 2],
+      pch = 19,
+      col = ifelse(d$flag, "red", "gray50"),
+      xlab = "PC1",
+      ylab = "PC2",
+      main = paste(name, "- Original Data"),
+      xlim = c(xmin, if (name == "track_w") 8 else xmax + xpad),
+      ylim = c(ymin, ymax + ypad)
+    )
+    
+    if (any(d$flag)) {
+      text(
+        d$scores[d$flag, 1],
+        d$scores[d$flag, 2],
+        labels = d$countries[d$flag],
+        pos = 3,
+        cex = 0.8
+      )
+    }
+  }
+  
+  
+  # ==========================================================
+  # 그림 2. 이상치 발생 후 PCA / OPCA MSE 비교
+  # ==========================================================
+  
+  for (name in names(datasets)) {
+    
+    d <- plot_data[[name]]
+    r <- d$results
+    
+    lim <- range(r[, c("Dirty_PCA", "Dirty_OPCA")])
+    
+    plot(
+      r[, "Dirty_PCA"],
+      r[, "Dirty_OPCA"],
+      xlim = lim,
+      ylim = lim,
+      pch = 19,
+      col = ifelse(
+        r[, "Dirty_OPCA"] < r[, "Dirty_PCA"],
+        "blue", "red"
+      ),
+      xlab = "PCA MSE",
+      ylab = "OPCA MSE",
+      main = paste(name, "- MSE Comparison")
+    )
+    
+    abline(0, 1, lty = 2)
+    
+    legend(
+      "topleft",
+      legend = c("OPCA better", "PCA better or equal"),
+      col = c("blue", "red"),
+      pch = 19,
+      cex = 0.75,
+      bty = "n"
+    )
+  }
+  
+  
+  # ==========================================================
+  # 그림 3. 인위적 이상치 탐지 결과
+  # ==========================================================
+  
+  for (name in names(datasets)) {
+    
+    d <- plot_data[[name]]
+    
+    image(
+      x = 1:B,
+      y = 1:3,
+      z = d$detected * 1,
+      col = c("tomato", "seagreen3"),
+      zlim = c(0, 1),
+      xlab = "Repetition",
+      ylab = "Injected observation",
+      main = paste(name, "- Outlier Detection"),
+      xaxt = "n",
+      yaxt = "n"
+    )
+    
+    axis(1, at = seq(5, B, by = 5))
+    axis(2, at = 1:3)
+    box()
+    
+    title(
+      sub = "Red: Missed / Green: Detected",
+      cex.sub = 0.85
+    )
+  }
+}
+
+draw_plots()
+```
+
+## 7.6 결과 해석
+
+실제 다변량 자료에 PCA와 OPCA를 적용한 결과, 원본 자료에서는 두 방법의 재구성 성능이 유사하게 나타났다. 반면 인위적으로 이상치를 발생시킨 경우에는 남녀 자료 모두에서 OPCA의 평균 재구성 MSE가 PCA보다 낮았으며, 주성분 안정성 역시 더 높게 나타났다.
+
+이상치 탐지율은 남자 자료에서 68.89%, 여자 자료에서 58.89%로 나타나 이상치 탐지 자체에서는 높은 성능을 보이지 않았다. 다만 일반 PCA보다 낮은 재구성 오차와 높은 주성분 안정성을 보였다.
+
+해당 결과는 OPCA가 이상치를 완벽하게 탐지하지 못하더라도, 일반 PCA에 비해 이상치의 영향을 줄이고 주성분을 상대적으로 안정적으로 추정할 수 있다고 할 수 있다.
+
+
+# 참고문헌
+
+Witten, D. M. (2013). *Penalized unsupervised learning with outliers*. Statistics and Its Interface, 6(2), 211–221. 본문 설명은 식 (24)–(26), Algorithm 3, Figure 4 및 4.3절의 Table 2 모의실험을 참고하였다.
+
